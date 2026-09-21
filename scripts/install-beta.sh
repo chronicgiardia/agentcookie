@@ -146,10 +146,53 @@ if [[ -z "$TARBALL" ]]; then
   if ! gh auth status >/dev/null 2>&1; then
     die "gh is not authenticated. Run 'gh auth login' first."
   fi
-  step "downloading latest release from $REPO"
+  # The "latest" release is not guaranteed to have a macOS build: the
+  # upstream release pipeline shipped v1.1.0 as linux-only. On top of
+  # that, the asset naming convention changed at v1.0.0:
+  #   <= v0.17.1   agentcookie-v0.17.1-darwin-arm64.tar.gz   (hyphens)
+  #   >= v1.0.0    agentcookie_1.0.0_darwin_arm64.tar.gz     (underscores)
+  # So rather than assuming latest-has-darwin, walk the releases
+  # newest-first and pick the first one that actually carries a
+  # darwin/arm64 tarball.
+  step "finding newest release with a macOS (darwin/arm64) build"
+  DARWIN_RELEASES="$(gh api "repos/$REPO/releases" --paginate --jq '
+      .[]
+      | select(.draft | not)
+      | select([.assets[].name] | any(test("darwin[-_]arm64.*\\.tar\\.gz$")))
+      | "\(.prerelease)\t\(.tag_name)"
+    ' 2>/dev/null || true)"
+
+  # Prefer a stable release; only fall back to a pre-release if no
+  # stable release has a macOS build at all.
+  RELEASE_TAG="$(printf '%s\n' "$DARWIN_RELEASES" | awk -F'\t' '$1=="false"{print $2; exit}')"
+  USED_PRERELEASE=""
+  if [[ -z "$RELEASE_TAG" ]]; then
+    RELEASE_TAG="$(printf '%s\n' "$DARWIN_RELEASES" | awk -F'\t' 'NF{print $2; exit}')"
+    USED_PRERELEASE="1"
+  fi
+
+  if [[ -z "$RELEASE_TAG" ]]; then
+    die "no release in $REPO publishes a darwin/arm64 asset. Download a tarball manually and re-run with --tarball <path>."
+  fi
+
+  LATEST_TAG="$(gh release view --repo "$REPO" --json tagName --jq .tagName 2>/dev/null || true)"
+  if [[ -n "$LATEST_TAG" && "$LATEST_TAG" != "$RELEASE_TAG" ]]; then
+    warn "latest release $LATEST_TAG has no macOS build; using $RELEASE_TAG instead"
+  fi
+  if [[ -n "$USED_PRERELEASE" ]]; then
+    warn "$RELEASE_TAG is a pre-release (no stable release has a macOS build)"
+  fi
+  ok "selected $RELEASE_TAG"
+
+  step "downloading $RELEASE_TAG from $REPO"
   TMP_DL="$(mktemp -d -t agentcookie-beta.XXXXXX)"
-  gh release download --repo "$REPO" --pattern '*darwin_arm64.tar.gz' --dir "$TMP_DL" --clobber
-  TARBALL="$(ls -1 "$TMP_DL"/*.tar.gz | head -n1)"
+  # '*darwin*' matches both naming conventions above and resolves to a
+  # single asset in every published release. Do not be tempted by
+  # '*darwin[-_]arm64.tar.gz': gh's --pattern does not support character
+  # classes and silently matches nothing. '*arm64*' is also wrong, as it
+  # additionally matches the linux_arm64 tarball.
+  gh release download "$RELEASE_TAG" --repo "$REPO" --pattern '*darwin*' --dir "$TMP_DL" --clobber
+  TARBALL="$(ls -1 "$TMP_DL"/*.tar.gz 2>/dev/null | head -n1 || true)"
   if [[ -z "$TARBALL" || ! -f "$TARBALL" ]]; then
     die "release tarball not found after download (looked in $TMP_DL)"
   fi
