@@ -155,12 +155,17 @@ if [[ -z "$TARBALL" ]]; then
   # newest-first and pick the first one that actually carries a
   # darwin/arm64 tarball.
   step "finding newest release with a macOS (darwin/arm64) build"
-  DARWIN_RELEASES="$(gh api "repos/$REPO/releases" --paginate --jq '
+  # Let gh's own error reach the user on failure, and keep its exit
+  # status, so that a network/auth/rate-limit problem is reported as
+  # such rather than being silently reinterpreted as "no macOS build".
+  if ! DARWIN_RELEASES="$(gh api "repos/$REPO/releases" --paginate --jq '
       .[]
       | select(.draft | not)
       | select([.assets[].name] | any(test("darwin[-_]arm64.*\\.tar\\.gz$")))
       | "\(.prerelease)\t\(.tag_name)"
-    ' 2>/dev/null || true)"
+    ')"; then
+    die "could not query releases from $REPO (see the gh error above). Check network access and 'gh auth status', or download the tarball manually and re-run with --tarball <path>."
+  fi
 
   # Prefer a stable release; only fall back to a pre-release if no
   # stable release has a macOS build at all.
@@ -175,6 +180,8 @@ if [[ -z "$TARBALL" ]]; then
     die "no release in $REPO publishes a darwin/arm64 asset. Download a tarball manually and re-run with --tarball <path>."
   fi
 
+  # Advisory only: used to tell the user we skipped past 'latest'. A
+  # failure here must not abort an otherwise healthy install.
   LATEST_TAG="$(gh release view --repo "$REPO" --json tagName --jq .tagName 2>/dev/null || true)"
   if [[ -n "$LATEST_TAG" && "$LATEST_TAG" != "$RELEASE_TAG" ]]; then
     warn "latest release $LATEST_TAG has no macOS build; using $RELEASE_TAG instead"
@@ -186,12 +193,16 @@ if [[ -z "$TARBALL" ]]; then
 
   step "downloading $RELEASE_TAG from $REPO"
   TMP_DL="$(mktemp -d -t agentcookie-beta.XXXXXX)"
-  # '*darwin*' matches both naming conventions above and resolves to a
-  # single asset in every published release. Do not be tempted by
-  # '*darwin[-_]arm64.tar.gz': gh's --pattern does not support character
-  # classes and silently matches nothing. '*arm64*' is also wrong, as it
-  # additionally matches the linux_arm64 tarball.
-  gh release download "$RELEASE_TAG" --repo "$REPO" --pattern '*darwin*' --dir "$TMP_DL" --clobber
+  # Match darwin AND arm64, mirroring the selection filter above. The
+  # wildcard between them absorbs both separators ('_' since v1.0.0,
+  # '-' before that). Narrower alternatives do not work: gh's --pattern
+  # has no character classes, so '*darwin[-_]arm64.tar.gz' silently
+  # matches nothing. Wider ones are unsafe: '*arm64*' also matches
+  # linux_arm64, and a bare '*darwin*' would match darwin_amd64, which
+  # .goreleaser.yaml declares and which sorts before darwin_arm64 --
+  # so the 'ls | head -n1' below would hand an Apple Silicon Mac an
+  # x86_64 binary.
+  gh release download "$RELEASE_TAG" --repo "$REPO" --pattern '*darwin*arm64*.tar.gz' --dir "$TMP_DL" --clobber
   TARBALL="$(ls -1 "$TMP_DL"/*.tar.gz 2>/dev/null | head -n1 || true)"
   if [[ -z "$TARBALL" || ! -f "$TARBALL" ]]; then
     die "release tarball not found after download (looked in $TMP_DL)"
